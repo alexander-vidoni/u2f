@@ -1,0 +1,171 @@
+---
+- hosts: all
+  become: true
+  tasks:
+    ### Abschnitt 2: Paketinstallation ###
+    - name: Aktiviere das Yubico PPA
+      apt_repository:
+        repo: "ppa:yubico/stable"
+        state: present
+      # Laut Anleitung benötigt für libpam-u2f ≥1.1.1 (Security Fix).
+
+    - name: Installiere libpam-u2f
+      apt:
+        name: libpam-u2f
+        state: present
+        update_cache: yes
+      # Entspricht Schritt 2 der Anleitung.
+
+    ### Abschnitt 3: Schlüsselgenerierung ###
+    - name: Erstelle das Yubico-Verzeichnis
+      file:
+        path: ~/.config/Yubico
+        state: directory
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+        mode: "0700"
+      # Erfüllt 'mkdir -p ~/.config/Yubico'.
+
+    - name: Generiere die U2F-Schlüsseldatei
+      shell: pamu2fcfg > ~/.config/Yubico/u2f_keys
+      args:
+        executable: /bin/bash
+      become: false
+      register: u2f_keys_result
+      changed_when: "'no matching tty' not in u2f_keys_result.stderr"
+      # Wichtig: Muss als normaler Benutzer ausgeführt werden (become: false).  Prompt für PIN möglich.
+
+    - name: Generiere zusätzliche U2F-Schlüssel (für Backup-Geräte)
+      shell: pamu2fcfg -n >> ~/.config/Yubico/u2f_keys
+      args:
+        executable: /bin/bash
+      become: false
+      when: add_backup_key | bool
+      # Optional für Backup-Keys gemäß Anleitung.  Prompt für PIN möglich.
+
+    ### Optionale Schlüsseldatei-Verschiebung ###
+    - name: Verschiebe die U2F-Schlüsseldatei nach /etc/Yubico (optional)
+      block:
+        - name: Erstelle das /etc/Yubico-Verzeichnis
+          file:
+            path: /etc/Yubico
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Verschiebe die U2F-Schlüsseldatei
+          command: mv ~/.config/Yubico/u2f_keys /etc/Yubico/u2f_keys
+          args:
+            creates: /etc/Yubico/u2f_keys  # Idempotenz
+
+        - name: Passe Berechtigungen der U2F-Schlüsseldatei an
+          file:
+            path: /etc/Yubico/u2f_keys
+            owner: root
+            group: root
+            mode: "0644"
+      when: move_u2f_keys_to_etc | bool
+      # Entspricht Anleitungsteil zur Sicherung in /etc.
+
+    - name: Warnung bei verschlüsseltem Home
+      assert:
+        that: not ansible_mounts | selectattr('mount', 'match', '^/home$') | map(attribute='encrypted') | first | default(false)
+        msg: "VORSICHT: Verschlüsselte /home-Partition kann bei move_u2f_keys_to_etc=true zu Lockout führen!"
+      when: move_u2f_keys_to_etc | bool
+
+    ### Abschnitt 4: PAM-Konfiguration ###
+    - name: Konfiguriere sudo, um U2F-Schlüssel zu verwenden
+      blockinfile:
+        path: /etc/pam.d/sudo
+        insertafter: "@include common-auth"
+        block: |
+          auth       required   pam_u2f.so{% if move_u2f_keys_to_etc | bool %} authfile=/etc/Yubico/u2f_keys{% endif %}
+        marker: "# {mark} YUBICO U2F CONFIG"
+      # Wichtig: marker verhindert mehrfaches Einfügen.  Test vor Aktivierung empfohlen!
+      # ACHTUNG:  Vor der Aktivierung der Anmeldung testen!
+
+    - name: Teste sudo-Konfiguration
+      shell: sudo -n true
+      register: sudo_test
+      failed_when: sudo_test.rc != 0
+      changed_when: false
+      # Muss MANUELL mit YubiKey durchgeführt werden!
+      # Notwendiger Test, um Lockout zu vermeiden!
+
+    - name: Konfiguriere gdm-password (Ubuntu 17.10+)
+      blockinfile:
+        path: /etc/pam.d/gdm-password
+        insertafter: "@include common-auth"
+        block: |
+          auth       required   pam_u2f.so{% if move_u2f_keys_to_etc | bool %} authfile=/etc/Yubico/u2f_keys{% endif %}
+        marker: "# {mark} YUBICO U2F CONFIG"
+      when: ansible_distribution == "Ubuntu" and ansible_distribution_version is version('17.10', '>=')
+      # Version-Check gemäß Anleitung.
+
+    - name: Konfiguriere lightdm (Ubuntu < 17.10)
+      blockinfile:
+        path: /etc/pam.d/lightdm
+        insertafter: "@include common-auth"
+        block: |
+          auth       required   pam_u2f.so{% if move_u2f_keys_to_etc | bool %} authfile=/etc/Yubico/u2f_keys{% endif %}
+        marker: "# {mark} YUBICO U2F CONFIG"
+      when: ansible_distribution == "Ubuntu" and ansible_distribution_version is version('17.10', '<')
+
+    - name: Konfiguriere TTY-Terminal
+      blockinfile:
+        path: /etc/pam.d/login
+        insertafter: "@include common-auth"
+        block: |
+          auth       required   pam_u2f.so{% if move_u2f_keys_to_etc | bool %} authfile=/etc/Yubico/u2f_keys{% endif %}
+        marker: "# {mark} YUBICO U2F CONFIG"
+
+    ### Abschnitt 5: Debugging ###
+    - name: Aktiviere den Debug-Modus
+      block:
+        - name: Erstelle die Debug-Logdatei
+          file:
+            path: /var/log/pam_u2f.log
+            state: touch
+            owner: root
+            group: adm
+            mode: "0640"
+          # Logdatei für Fehlersuche
+
+        - name: Konfiguriere gdm-password Debugging
+          lineinfile:
+            path: /etc/pam.d/gdm-password
+            regexp: "^auth\\s+required\\s+pam_u2f\\.so"
+            line: "auth       required   pam_u2f.so{% if move_u2f_keys_to_etc | bool %} authfile=/etc/Yubico/u2f_keys{% endif %} debug debug_file=/var/log/pam_u2f.log"
+          when: "ansible_distribution == 'Ubuntu' and ansible_distribution_version is version('17.10', '>=') and enable_debug_mode | bool"
+          # Füge Debug-Option hinzu
+
+        - name: Konfiguriere lightdm Debugging
+          lineinfile:
+            path: /etc/pam.d/lightdm
+            regexp: "^auth\\s+required\\s+pam_u2f\\.so"
+            line: "auth       required   pam_u2f.so{% if move_u2f_keys_to_etc | bool %} authfile=/etc/Yubico/u2f_keys{% endif %} debug debug_file=/var/log/pam_u2f.log"
+          when: "ansible_distribution == 'Ubuntu' and ansible_distribution_version is version('17.10', '<') and enable_debug_mode | bool"
+          # Füge Debug-Option hinzu
+      when: enable_debug_mode | bool
+      # Debug-Modus nur bei Bedarf aktivieren
+
+    - name: Aktiviere PIN-Abfrage (Optional)
+      lineinfile:
+        path: "{{ item }}"
+        regexp: "^auth\\s+required\\s+pam_u2f\\.so"
+        line: "auth       required   pam_u2f.so{% if move_u2f_keys_to_etc | bool %} authfile=/etc/Yubico/u2f_keys{% endif %} pinverification=1"
+      loop:
+        - /etc/pam.d/sudo
+        - /etc/pam.d/gdm-password
+        - /etc/pam.d/login
+      when: enable_pin | bool
+      # Aktiviert PIN-Abfrage für erhöhte Sicherheit
+      # Erfordert YubiKey mit PIN-Konfiguration!
+
+  vars:
+    move_u2f_keys_to_etc: false # Bewege die Schlüsseldatei nach /etc/Yubico (erfordert root). WARNUNG: Verschlüsselte Home-Verzeichnisse können Probleme verursachen!
+    enable_debug_mode: false # Aktiviere Debug-Modus (erzeugt Logdatei /var/log/pam_u2f.log).
+    add_backup_key: false # Füge einen zusätzlichen Schlüssel für Backup-Geräte hinzu.
+    enable_pin: false # Aktiviere PIN-Abfrage für zusätzliche Sicherheit (erfordert YubiKey mit PIN-Konfiguration)
+
